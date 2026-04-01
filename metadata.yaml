@@ -1,4 +1,5 @@
 name: astrbot_plugin_group_sender
-author: ChatGPT
-desc: 私聊机器人后可查看群列表、群发消息、定时发送消息
+author: 何意味小祥
+desc: AstrBot 群发与定时发送插件，支持私聊控制群发、指定群发送、群列表查看、每天定时发送和一次性定时任务。 温馨提示：使用前请先把main.py改为你自己的qq号 否则无法使用
 version: 1.1.0
+repo: https://github.com/c99180013-sys/AstrBOT-Group-sending-plug-in
