@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+*.log
+*.db
+*.db-shm
+*.db-wal
+data/plugin_data/

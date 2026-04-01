@@ -1,0 +1,4 @@
+name: astrbot_plugin_group_sender
+author: ChatGPT
+desc: 私聊机器人后可查看群列表、群发消息、定时发送消息
+version: 1.1.0
