@@ -2,27 +2,27 @@ import re
 import json
 import asyncio
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import List, Dict, Optional
 
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.api import logger
 
 
 @register(
     "astrbot_plugin_group_sender",
-    "ChatGPT",
+    "何意味小祥",
     "私聊机器人后，使用 /发送 和 /定时发送 管理群发/定时发送",
-    "1.1.0",
+    "1.1.1",
 )
 class GroupSenderPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
         self.allowed_user_ids = {"3827675264"}
-        self.data_dir = Path("data/plugin_data/astrbot_plugin_group_sender")
+        self.data_dir = StarTools.get_data_dir("astrbot_plugin_group_sender")
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.schedule_file = self.data_dir / "schedules.json"
+        self._schedule_lock = asyncio.Lock()
         self.schedules: List[Dict] = self._load_schedules()
         self._scheduler_task = None
         self._scheduler_started = False
@@ -38,8 +38,10 @@ class GroupSenderPlugin(Star):
             self._scheduler_task.cancel()
             try:
                 await self._scheduler_task
-            except Exception:
+            except asyncio.CancelledError:
                 pass
+            except Exception as e:
+                logger.error(f"[GroupSender] 终止调度器时发生异常: {e}")
 
     def _load_schedules(self) -> List[Dict]:
         if not self.schedule_file.exists():
@@ -50,7 +52,7 @@ class GroupSenderPlugin(Star):
             logger.error(f"[GroupSender] 读取定时任务失败: {e}")
             return []
 
-    def _save_schedules(self):
+    def _save_schedules_unlocked(self):
         try:
             self.schedule_file.write_text(
                 json.dumps(self.schedules, ensure_ascii=False, indent=2),
@@ -59,7 +61,7 @@ class GroupSenderPlugin(Star):
         except Exception as e:
             logger.error(f"[GroupSender] 保存定时任务失败: {e}")
 
-    def _next_id(self) -> int:
+    def _next_id_unlocked(self) -> int:
         return max([int(x.get("id", 0)) for x in self.schedules] + [0]) + 1
 
     def _get_sender_id(self, event: AstrMessageEvent) -> str:
@@ -72,6 +74,7 @@ class GroupSenderPlugin(Star):
                 return ""
 
     def _is_private_chat(self, event: AstrMessageEvent) -> bool:
+        """默认拒绝，判断失败时返回 False。"""
         try:
             origin = str(getattr(event, 'unified_msg_origin', '') or '')
             if 'FriendMessage' in origin:
@@ -99,7 +102,7 @@ class GroupSenderPlugin(Star):
         except Exception:
             pass
 
-        return True
+        return False
 
     async def _get_all_groups(self, event: AstrMessageEvent) -> List[Dict]:
         try:
@@ -173,6 +176,8 @@ class GroupSenderPlugin(Star):
             content = m_once.group(6).strip()
             try:
                 dt = datetime(y, mo, d, hh, mm, 0)
+                if dt <= datetime.now():
+                    return {'error': '过去时间'}
                 if content:
                     return {
                         'target': target,
@@ -206,33 +211,34 @@ class GroupSenderPlugin(Star):
         await asyncio.sleep(3)
         while True:
             try:
-                now = datetime.now()
-                changed = False
-                for item in list(self.schedules):
-                    if not item.get('enabled', True):
-                        continue
-                    next_run = self._calc_next_run(item)
-                    if not next_run:
-                        continue
-                    last_run = item.get('last_run', '')
-                    if next_run <= now:
-                        ok = await self._execute_schedule(item)
-                        item['last_run'] = now.strftime('%Y-%m-%d %H:%M:%S')
-                        item['last_status'] = 'success' if ok else 'failed'
-                        changed = True
-                        if item.get('mode') == 'once':
-                            item['enabled'] = False
-                    elif last_run:
-                        pass
-                if changed:
-                    self._save_schedules()
+                async with self._schedule_lock:
+                    now = datetime.now()
+                    changed = False
+                    snapshot = list(self.schedules)
+                    for item in snapshot:
+                        if not item.get('enabled', True):
+                            continue
+                        next_run = self._calc_next_run(item)
+                        if not next_run:
+                            continue
+                        if next_run <= now:
+                            ok = await self._execute_schedule(item)
+                            item['last_run'] = now.strftime('%Y-%m-%d %H:%M:%S')
+                            item['last_status'] = 'success' if ok else 'failed'
+                            changed = True
+                            if item.get('mode') == 'once' and ok:
+                                item['enabled'] = False
+                    if changed:
+                        self._save_schedules_unlocked()
+            except asyncio.CancelledError:
+                logger.info('[GroupSender] 调度循环已取消')
+                raise
             except Exception as e:
                 logger.error(f'[GroupSender] 调度循环异常: {e}')
             await asyncio.sleep(20)
 
     async def _execute_schedule(self, item: Dict) -> bool:
         try:
-            # 尝试从上下文里拿 bot
             bot = None
             try:
                 bot = self.context.get_platform_manager().get_default_platform().get_client()
@@ -347,6 +353,9 @@ class GroupSenderPlugin(Star):
 
         raw_text = (getattr(event, 'message_str', '') or '').strip()
         parsed = self._parse_schedule_text(raw_text)
+        if parsed and parsed.get('error') == '过去时间':
+            yield event.plain_result('不能创建过去时间的一次性定时任务，请重新输入未来时间。')
+            return
         if not parsed:
             yield event.plain_result(
                 '格式错误。\n'
@@ -360,25 +369,27 @@ class GroupSenderPlugin(Star):
             )
             return
 
-        item = {
-            'id': self._next_id(),
-            'target': parsed['target'],
-            'mode': parsed['mode'],
-            'time_text': parsed['time_text'],
-            'content': parsed['content'],
-            'enabled': True,
-            'created_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'last_run': '',
-            'last_status': '',
-        }
-        if parsed['mode'] == 'daily':
-            item['hour'] = parsed['hour']
-            item['minute'] = parsed['minute']
-        if parsed['mode'] == 'once':
-            item['run_at'] = parsed['run_at']
+        async with self._schedule_lock:
+            item = {
+                'id': self._next_id_unlocked(),
+                'target': parsed['target'],
+                'mode': parsed['mode'],
+                'time_text': parsed['time_text'],
+                'content': parsed['content'],
+                'enabled': True,
+                'created_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'last_run': '',
+                'last_status': '',
+            }
+            if parsed['mode'] == 'daily':
+                item['hour'] = parsed['hour']
+                item['minute'] = parsed['minute']
+            if parsed['mode'] == 'once':
+                item['run_at'] = parsed['run_at']
 
-        self.schedules.append(item)
-        self._save_schedules()
+            self.schedules.append(item)
+            self._save_schedules_unlocked()
+
         yield event.plain_result(f"定时任务已创建。\n编号：{item['id']}\n目标：{item['target']}\n时间：{item['time_text']}\n内容：{item['content']}")
 
     @filter.command("定时列表")
@@ -388,16 +399,17 @@ class GroupSenderPlugin(Star):
             yield event.plain_result(deny)
             return
 
-        if not self.schedules:
-            yield event.plain_result('当前没有定时任务。')
-            return
+        async with self._schedule_lock:
+            if not self.schedules:
+                yield event.plain_result('当前没有定时任务。')
+                return
 
-        lines = ['当前定时任务：']
-        for item in self.schedules:
-            status = '启用' if item.get('enabled', True) else '已停用'
-            lines.append(
-                f"[{item.get('id')}] {status} | 目标:{item.get('target')} | 时间:{item.get('time_text')} | 内容:{item.get('content')}"
-            )
+            lines = ['当前定时任务：']
+            for item in self.schedules:
+                status = '启用' if item.get('enabled', True) else '已停用'
+                lines.append(
+                    f"[{item.get('id')}] {status} | 目标:{item.get('target')} | 时间:{item.get('time_text')} | 内容:{item.get('content')} | 上次结果:{item.get('last_status', '')}"
+                )
         yield event.plain_result('\n'.join(lines))
 
     @filter.command("取消定时")
@@ -414,10 +426,12 @@ class GroupSenderPlugin(Star):
             return
 
         sid = int(text)
-        before = len(self.schedules)
-        self.schedules = [x for x in self.schedules if int(x.get('id', 0)) != sid]
-        after = len(self.schedules)
-        self._save_schedules()
+        async with self._schedule_lock:
+            before = len(self.schedules)
+            self.schedules = [x for x in self.schedules if int(x.get('id', 0)) != sid]
+            after = len(self.schedules)
+            self._save_schedules_unlocked()
+
         if after < before:
             yield event.plain_result(f'已删除定时任务 {sid}')
         else:
